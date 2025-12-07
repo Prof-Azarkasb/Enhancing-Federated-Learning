@@ -1,135 +1,329 @@
-import numpy as np
+"""
+grafl_signsgd_google_cluster.py
+Gradient Federated Learning (SignSGD-style with optional momentum) adapted for
+Google 2019 Cluster sample (Kaggle). Clients are batches of job rows (round-robin).
+"""
+
+import os
+import glob
 import random
 import time
-import psutil
+from typing import List, Tuple
 
-# Constants for federated learning setup
-NUM_CLIENTS = 10  # Number of participating clients
-NUM_ROUNDS = 100  # Number of global training rounds
-LEARNING_RATE = 0.01  # Learning rate for local updates
-TRANSMISSION_COST = 0.1  # Network transmission cost (bit-based compression)
-MOMENTUM = 0.9  # Momentum for signSGD with momentum
-FAILURE_RATE = 0.2  # Probability of client failure during communication
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, losses, metrics
 
-# Client class simulating each federated learning client
-class Client:
-    def __init__(self, client_id, data_size, computation_power):
-        self.client_id = client_id
-        self.data_size = data_size
-        self.computation_power = computation_power
-        self.model = np.random.randn(10)  # Initialize model with random weights
-        self.momentum = np.zeros_like(self.model)  # Initialize momentum term
+# optional system monitor
+try:
+    import psutil
+except Exception:
+    psutil = None
 
-    def compute_local_gradient(self, global_model):
-        """
-        Compute the local gradient based on the current global model.
-        The gradient is computed stochastically, simulating real-world federated learning.
-        """
-        local_gradient = (self.model - global_model) + np.random.normal(scale=0.01, size=self.model.shape)
-        return local_gradient
-    
-    def update_model(self, global_model, sign_gradient):
-        """
-        Update the local model using the global model and the signed gradient.
-        The local model is updated using momentum-based signSGD, which only uses the sign of the gradient.
-        """
-        self.momentum = MOMENTUM * self.momentum + sign_gradient
-        self.model = global_model - LEARNING_RATE * np.sign(self.momentum)
+# ------------------ Configuration ------------------
+DATA_DIR = "./data"               # folder with Google Cluster CSVs
+NUM_CLIENTS = 10                  # number of federated clients (batches)
+INPUT_FEATURES = 8                # number of numeric columns per job (pad/truncate)
+LOCAL_EPOCHS = 2                  # local epochs used to compute gradients
+LOCAL_BATCH = 32
+GLOBAL_ROUNDS = 30
+SIGNSGD_LR = 0.01                 # server step size
+MOMENTUM = 0.9                    # momentum coefficient (use 0.0 to disable)
+FAILURE_RATE = 0.12               # probability a client fails to send grads
+TEST_HOLDOUT_RATIO = 0.15
+RANDOM_SEED = 42
 
-    def train(self, epochs=1, batch_size=32):
-        """
-        Trains the model on local data while measuring resource consumption.
-        """
-        start_cpu = psutil.cpu_percent(interval=None)
-        start_memory = psutil.virtual_memory().percent
-        
-        # Simulate training process
-        for _ in range(epochs):
-            _ = self.model * 0.9  # Dummy operation to simulate training
-        
-        end_cpu = psutil.cpu_percent(interval=None)
-        end_memory = psutil.virtual_memory().percent
-        
-        print(f"Client {self.client_id} - CPU Consumption: {end_cpu - start_cpu:.2f}%, Memory Consumption: {end_memory - start_memory:.2f}%")
+# reproducibility
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
 
-# Gradient Federated Learning Server class
-class FederatedServer:
-    def __init__(self):
-        self.global_model = np.random.randn(10)  # Initialize global model randomly
 
-    def aggregate_sign_gradients(self, client_gradients):
-        """
-        Aggregates gradients using a majority vote on the signs of the gradient components.
-        This approach allows for 1-bit communication, compressing the gradients significantly.
-        """
-        sign_aggregate = np.sign(np.sum(np.sign(client_gradients), axis=0))
-        return sign_aggregate
+# ------------------ Data utilities ------------------
+def list_csv_files(data_dir: str) -> List[str]:
+    files = glob.glob(os.path.join(data_dir, "*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No CSV files found in {data_dir}. Place the Kaggle CSV files there.")
+    return sorted(files)
 
-# Gradient Federated Learning (Gra-FL) class
-class GradientFederatedLearning:
-    def __init__(self, num_clients, num_rounds):
-        self.clients = [Client(client_id=i, data_size=random.randint(1000, 5000), 
-                               computation_power=random.uniform(1, 10)) for i in range(num_clients)]
-        self.num_rounds = num_rounds
-        self.server = FederatedServer()
-    
-    def run(self):
-        """
-        Execute the Gradient Federated Learning (Gra-FL) process, involving local updates, 
-        compression of gradient signs, and global model aggregation using majority voting.
-        """
-        for round_num in range(self.num_rounds):
-            print(f"--- Round {round_num + 1} ---")
-            client_gradients = []
-            communication_latency_total = 0
 
-            # Each client computes the local gradient and transmits the sign of the gradient
-            for client in self.clients:
-                if random.random() > FAILURE_RATE:  # Simulate network failure for some clients
-                    start_time = time.time()
-                    local_gradient = client.compute_local_gradient(self.server.global_model)
-                    sign_gradient = np.sign(local_gradient)
-                    client_gradients.append(sign_gradient)
-                    end_time = time.time()
-                    
-                    # Measure communication latency
-                    communication_latency = end_time - start_time
-                    communication_latency_total += communication_latency
-                    print(f"Client {client.client_id} - Communication Latency: {communication_latency:.4f} seconds")
+def extract_numeric_features_from_df(df: pd.DataFrame, max_cols: int = INPUT_FEATURES
+                                     ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Select up to max_cols numeric columns from df, pad/truncate to shape (n_rows, max_cols).
+    Target y is row-wise mean of selected numeric columns (proxy regression target).
+    """
+    numeric = df.select_dtypes(include=[np.number]).fillna(0.0)
+    if numeric.shape[1] == 0:
+        return np.empty((0, max_cols), dtype=np.float32), np.empty((0,), dtype=np.float32)
+    cols = list(numeric.columns)[:max_cols]
+    X = numeric[cols].to_numpy(dtype=np.float32)
+    if X.shape[1] < max_cols:
+        pad = np.zeros((X.shape[0], max_cols - X.shape[1]), dtype=np.float32)
+        X = np.hstack([X, pad])
+    y = np.mean(X[:, :len(cols)], axis=1).astype(np.float32)
+    return X, y
+
+
+def build_clients_from_files(files: List[str], num_clients: int = NUM_CLIENTS, input_features: int = INPUT_FEATURES
+                             ) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], Tuple[np.ndarray, np.ndarray]]:
+    """
+    Read CSVs, convert each file to (Xf, yf), pool all rows from non-holdout files,
+    then assign rows round-robin into num_clients batches.
+    Returns clients_data list of (X_client, y_client) and (X_test, y_test).
+    """
+    files = files.copy()
+    random.shuffle(files)
+    n_holdout = max(1, int(len(files) * TEST_HOLDOUT_RATIO))
+    holdout_files = files[:n_holdout]
+    pool_files = files[n_holdout:]
+
+    # build test set from holdout files
+    X_test_list, y_test_list = [], []
+    for f in holdout_files:
+        try:
+            df = pd.read_csv(f, low_memory=True)
+        except Exception:
+            continue
+        Xf, yf = extract_numeric_features_from_df(df, input_features)
+        if Xf.shape[0] > 0:
+            X_test_list.append(Xf); y_test_list.append(yf)
+    if X_test_list:
+        X_test = np.vstack(X_test_list); y_test = np.concatenate(y_test_list)
+    else:
+        X_test = np.empty((0, input_features), dtype=np.float32); y_test = np.empty((0,), dtype=np.float32)
+
+    # pool rows from pool_files
+    pool_X = []
+    pool_y = []
+    for f in pool_files:
+        try:
+            df = pd.read_csv(f, low_memory=True)
+        except Exception:
+            continue
+        Xf, yf = extract_numeric_features_from_df(df, input_features)
+        if Xf.shape[0] > 0:
+            pool_X.append(Xf); pool_y.append(yf)
+    if not pool_X:
+        raise RuntimeError("No usable numeric rows found in dataset files.")
+    pool_X = np.vstack(pool_X); pool_y = np.concatenate(pool_y)
+
+    # shuffle rows
+    idx = np.arange(pool_X.shape[0])
+    np.random.shuffle(idx)
+    pool_X = pool_X[idx]; pool_y = pool_y[idx]
+
+    # round-robin assignment to clients
+    clients_chunks_X = [[] for _ in range(num_clients)]
+    clients_chunks_y = [[] for _ in range(num_clients)]
+    for i in range(pool_X.shape[0]):
+        cid = i % num_clients
+        clients_chunks_X[cid].append(pool_X[i])
+        clients_chunks_y[cid].append(pool_y[i])
+
+    clients_data = []
+    for cid in range(num_clients):
+        Xc = np.vstack(clients_chunks_X[cid]).astype(np.float32) if clients_chunks_X[cid] else np.empty((0, input_features), dtype=np.float32)
+        yc = np.array(clients_chunks_y[cid], dtype=np.float32) if clients_chunks_y[cid] else np.empty((0,), dtype=np.float32)
+        # ensure clients not empty
+        if Xc.shape[0] < 8:
+            extra = np.random.rand(8, input_features).astype(np.float32) * 1e-3
+            Xc = np.vstack([Xc, extra]) if Xc.size else extra
+            yc = np.concatenate([yc, np.zeros(8, dtype=np.float32)]) if yc.size else np.zeros(8, dtype=np.float32)
+        clients_data.append((Xc, yc))
+    return clients_data, (X_test, y_test)
+
+
+# ------------------ Model factory ------------------
+def create_regressor(input_dim: int):
+    model = models.Sequential([
+        layers.InputLayer(input_shape=(input_dim,)),
+        layers.Dense(128, activation='relu'),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(1, activation='linear')
+    ])
+    # compile not necessary for manual gradient computations but useful for evaluation
+    model.compile(optimizer=optimizers.SGD(0.01), loss=losses.MeanSquaredError(), metrics=[metrics.MeanSquaredError()])
+    return model
+
+
+# ------------------ Client (computes grads signs) ------------------
+class GraClient:
+    def __init__(self, cid: int, X: np.ndarray, y: np.ndarray):
+        self.id = cid
+        self.X = X
+        self.y = y
+        self.n = X.shape[0]
+        self.model = create_regressor(self.X.shape[1])
+        self.scaler = None
+
+    def set_weights(self, weights: List[np.ndarray]):
+        self.model.set_weights(weights)
+
+    def get_weights(self) -> List[np.ndarray]:
+        return self.model.get_weights()
+
+    def compute_avg_gradients(self, epochs: int = LOCAL_EPOCHS, batch_size: int = LOCAL_BATCH) -> List[np.ndarray]:
+        """
+        Compute average gradients for local data over `epochs` and return list of numpy arrays (float)
+        """
+        if self.X.shape[0] == 0:
+            return None
+        ds = tf.data.Dataset.from_tensor_slices((self.X, self.y)).shuffle(1000, seed=RANDOM_SEED).batch(batch_size)
+        accum = None
+        steps = 0
+        for ep in range(epochs):
+            for xb, yb in ds:
+                with tf.GradientTape() as tape:
+                    preds = self.model(xb, training=True)
+                    loss = tf.reduce_mean(tf.keras.losses.MSE(yb, tf.squeeze(preds)))
+                grads = tape.gradient(loss, self.model.trainable_variables)
+                grads_np = [g.numpy().astype(np.float32) if g is not None else np.zeros_like(w.numpy()) for g, w in zip(grads, self.model.trainable_variables)]
+                if accum is None:
+                    accum = [np.array(g, dtype=np.float32) for g in grads_np]
                 else:
-                    print(f"Client {client.client_id} failed to communicate.")
-            
-            if client_gradients:
-                # Server aggregates the signed gradients using majority voting
-                aggregated_sign_gradient = self.server.aggregate_sign_gradients(client_gradients)
-                print(f"Aggregated Sign Gradient: {aggregated_sign_gradient}")
-                
-                # Update global model using the aggregated sign of gradients
-                self.server.global_model -= LEARNING_RATE * aggregated_sign_gradient
-                print(f"Updated Global Model: {self.server.global_model}")
-                
-                # Each client updates its local model using the signed gradient
-                for client in self.clients:
-                    client.update_model(self.server.global_model, aggregated_sign_gradient)
+                    for i in range(len(accum)):
+                        accum[i] += grads_np[i]
+                steps += 1
+        if steps == 0 or accum is None:
+            return None
+        avg = [a / float(steps) for a in accum]
+        return avg
 
-            # Log the average model performance for this round (for evaluation purposes)
-            average_loss = self.evaluate_global_model()
-            print(f"Average Loss after Round {round_num + 1}: {average_loss}")
-            print(f"Total Communication Latency for Round {round_num + 1}: {communication_latency_total:.4f} seconds\n")
-    
-    def evaluate_global_model(self):
+    def compute_signs(self, avg_grads: List[np.ndarray]) -> List[np.int8]:
         """
-        Evaluate the global model on all clients, simulating global model performance.
-        For simplicity, we use a mock evaluation with randomly generated losses.
+        Convert averaged gradients to sign arrays (-1,0,1) per weight array
         """
-        total_loss = 0
-        for client in self.clients:
-            loss = np.linalg.norm(client.model - self.server.global_model)
-            total_loss += loss
-        average_loss = total_loss / len(self.clients)
-        return average_loss
+        if avg_grads is None:
+            return None
+        signs = [np.sign(g).astype(np.int8) for g in avg_grads]
+        return signs
 
-# Running the Gradient Federated Learning (Gra-FL) simulation
+
+# ------------------ Server (aggregates signs & updates global) ------------------
+class GraServer:
+    def __init__(self, clients: List[GraClient], lr: float = SIGNSGD_LR, momentum: float = MOMENTUM):
+        self.clients = clients
+        self.lr = lr
+        self.momentum_coeff = momentum
+        # initialize global weights from first client
+        init_weights = [c.get_weights() for c in clients if c.get_weights()]
+        self.global_weights = init_weights[0] if init_weights else None
+        # initialize momentum buffers matching weight shapes (float)
+        if self.global_weights is not None:
+            self.momentum_buffers = [np.zeros_like(w, dtype=np.float32) for w in self.global_weights]
+        else:
+            self.momentum_buffers = None
+
+    def broadcast(self):
+        if self.global_weights is None:
+            return
+        for c in self.clients:
+            c.set_weights(self.global_weights)
+
+    def aggregate_and_update(self, signs_from_clients: List[List[np.ndarray]]):
+        """
+        signs_from_clients: list of clients, each is list of sign arrays per-layer
+        Aggregation: sum signs per element => aggregated_sum array
+        If momentum_coeff > 0: momentum = momentum_coeff * momentum + aggregated_sum
+        update: global_weights -= lr * sign(momentum_or_aggregated_sum)
+        """
+        if not signs_from_clients:
+            return
+        layer_count = len(signs_from_clients[0])
+        # accumulator
+        acc = [np.zeros_like(signs_from_clients[0][i], dtype=np.int32) for i in range(layer_count)]
+        for s in signs_from_clients:
+            for i in range(layer_count):
+                acc[i] += s[i].astype(np.int32)
+        # convert acc to float for momentum update
+        acc_f = [a.astype(np.float32) for a in acc]
+        # initialize momentum if needed
+        if self.momentum_buffers is None:
+            self.momentum_buffers = [np.zeros_like(w, dtype=np.float32) for w in self.global_weights]
+        # update momentum buffers
+        for i in range(layer_count):
+            self.momentum_buffers[i] = self.momentum_coeff * self.momentum_buffers[i] + acc_f[i]
+        # compute sign of momentum buffer (where zero -> 0)
+        agg_sign = [np.sign(mb).astype(np.int8) for mb in self.momentum_buffers]
+        # apply update: w <- w - lr * sign(mb)
+        new_weights = []
+        for w, s in zip(self.global_weights, agg_sign):
+            step = self.lr * s.astype(np.float32)
+            new_w = w - step
+            new_weights.append(new_w)
+        self.global_weights = new_weights
+        # broadcast new global to clients
+        self.broadcast()
+
+
+# ------------------ Orchestration ------------------
+def run_gra_fl(clients_data: List[Tuple[np.ndarray, np.ndarray]], X_test: np.ndarray, y_test: np.ndarray):
+    # global scaling: fit StandardScaler on all features
+    all_X = np.vstack([X for X, _ in clients_data] + ([X_test] if X_test.shape[0] > 0 else []))
+    scaler = StandardScaler()
+    scaler.fit(all_X)
+    clients_objs = []
+    for i, (Xc, yc) in enumerate(clients_data):
+        Xc_s = scaler.transform(Xc).astype(np.float32)
+        yc_s = yc.astype(np.float32)
+        c = GraClient(i, Xc_s, yc_s)
+        clients_objs.append(c)
+
+    server = GraServer(clients_objs, lr=SIGNSGD_LR, momentum=MOMENTUM)
+    server.broadcast()
+
+    for r in range(1, GLOBAL_ROUNDS + 1):
+        print(f"\n=== Gra-FL Round {r}/{GLOBAL_ROUNDS} ===")
+        collected_signs = []
+        total_comm_latency = 0.0
+        for c in clients_objs:
+            if random.random() < FAILURE_RATE:
+                print(f"Client {c.id} simulated failure (no contribution).")
+                continue
+            # client computes avg gradients
+            t0 = time.time()
+            avg_grads = c.compute_avg_gradients(epochs=LOCAL_EPOCHS, batch_size=LOCAL_BATCH)
+            signs = c.compute_signs(avg_grads)
+            t1 = time.time()
+            if signs is not None:
+                collected_signs.append(signs)
+                latency = t1 - t0
+                total_comm_latency += latency
+                print(f" Client {c.id} contributed signs; n_samples={c.n}; latency={latency:.4f}s")
+        if collected_signs:
+            t0 = time.time()
+            server.aggregate_and_update(collected_signs)
+            t1 = time.time()
+            print(f" Aggregation + update time: {t1 - t0:.4f}s")
+        else:
+            print(" No contributions this round — skipping update.")
+
+        # evaluate global model
+        if X_test.shape[0] > 0 and server.global_weights is not None:
+            eval_model = create_regressor(X_test.shape[1])
+            eval_model.set_weights(server.global_weights)
+            loss = eval_model.evaluate(X_test, y_test, verbose=0)
+            if isinstance(loss, list):
+                mse = float(loss[0])
+            else:
+                mse = float(loss)
+            print(f" Global test MSE after round {r}: {mse:.6f}")
+        else:
+            print(" No test evaluation available.")
+
+        if psutil:
+            print(f" System CPU%: {psutil.cpu_percent(interval=0.2)} Mem%: {psutil.virtual_memory().percent}")
+        print(f" Total communication latency this round: {total_comm_latency:.4f}s")
+
+    print("\nGra-FL (SignSGD) finished.")
+
+
+# ------------------ Main ------------------
 if __name__ == "__main__":
-    gra_fl = GradientFederatedLearning(num_clients=NUM_CLIENTS, num_rounds=NUM_ROUNDS)
-    gra_fl.run()
+    files = list_csv_files(DATA_DIR)
+    clients_data, (X_test, y_test) = build_clients_from_files(files, num_clients=NUM_CLIENTS, input_features=INPUT_FEATURES)
+    run_gra_fl(clients_data, X_test, y_test)

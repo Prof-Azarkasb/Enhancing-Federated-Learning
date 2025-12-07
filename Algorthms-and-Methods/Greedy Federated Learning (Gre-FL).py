@@ -1,154 +1,353 @@
-import numpy as np
+"""
+Greedy Federated Learning (Gre-FL) adapted to Google 2019 Cluster sample.
+
+Design decisions (per user instruction):
+ - Clients are built from BATCHES OF JOBS (round-robin assignment of job rows to clients).
+ - Task (supervised, per-job): predict a proxy target derived from job numeric fields
+   (we use the per-row mean of selected numeric columns as regression target).
+ - Each client trains a small MLP locally; server aggregates via FedAvg (weighted by samples).
+ - Greedy task scheduler allocates a fixed resource pool each round to clients with
+   highest priority (priority = computation_power * avg_local_target).
+ - Simulate client failures; measure aggregation latency; optional psutil monitoring.
+ """
+
+import os
+import glob
 import random
-import psutil  # For measuring resource consumption
-import time  # For measuring communication latency
-from collections import defaultdict
+import time
+from typing import List, Tuple
 
-# Constants for the federated learning environment
-NUM_CLIENTS = 10  # Number of participating clients in FL
-NUM_ROUNDS = 100  # Total number of training rounds in FL
-MAX_RESOURCES = 100  # Maximum available resources at each edge node (task scheduling)
-RESOURCE_SCALING_FACTOR = 0.7  # Resource adjustment factor
-TRANSMISSION_COST = 0.1  # Network transmission cost
-FAILURE_RATE = 0.2  # Rate of client failure simulation
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, losses, metrics
 
-# Client class to simulate each federated learning client
-class Client:
-    def __init__(self, client_id, data_size, computation_power):
-        self.client_id = client_id
-        self.data_size = data_size
-        self.computation_power = computation_power
-        self.model = None  # Placeholder for the client's local model
-    
-    def compute_loss(self, model):
-        """
-        Simulates the client's loss computation based on model updates.
-        The client's contribution depends on the local dataset and model parameters.
-        """
-        # Simulating model loss using a random factor for simplicity
-        loss = np.random.rand() * self.data_size / self.computation_power
-        return loss
+# optional resource monitor
+try:
+    import psutil
+except Exception:
+    psutil = None
 
-    def update_model(self, global_model):
-        """
-        Updates the local model with the global model received from the server.
-        """
-        self.model = global_model
+# ---------------- CONFIG ----------------
+DATA_DIR = "./data"              # folder containing Google 2019 Cluster CSV files
+NUM_CLIENTS = 10                 # number of federated clients (batches of jobs)
+INPUT_FEATURES = 6               # number of numeric columns picked as features per job (capped)
+LOCAL_EPOCHS = 3                 # local training epochs per round
+BATCH_SIZE = 32
+GLOBAL_ROUNDS = 20
+LEARNING_RATE = 1e-3
+RESOURCE_POOL = 100.0            # total resource units (arbitrary units) per round to allocate
+RESOURCE_SCALING = 0.7           # factor used in greedy allocation
+FAILURE_RATE = 0.12              # per-client failure/dropout probability per round
+TEST_HOLDOUT_RATIO = 0.15        # fraction of files held out as global test set
+RANDOM_SEED = 42
 
-    def train(self, epochs=1, batch_size=32):
-        """
-        Trains the model on local data while measuring resource consumption.
-        """
-        start_cpu = psutil.cpu_percent(interval=None)
-        start_memory = psutil.virtual_memory().percent
-        
-        # Simulate local training
-        for _ in range(epochs):
-            _ = self.compute_loss(self.model)  # Simulating model training
-        
-        end_cpu = psutil.cpu_percent(interval=None)
-        end_memory = psutil.virtual_memory().percent
-        
-        print(f"Client {self.client_id} - CPU Consumption: {end_cpu - start_cpu:.2f}%, Memory Consumption: {end_memory - start_memory:.2f}%")
-        
-        return np.random.rand()  # Return a simulated model update
+# reproducibility
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
 
-# Greedy Task Scheduler class
+
+# ---------------- Data utilities ----------------
+def list_csv_files(data_dir: str) -> List[str]:
+    files = glob.glob(os.path.join(data_dir, "*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No CSV files found in {data_dir}. Please download the Kaggle dataset and put CSVs there.")
+    return sorted(files)
+
+
+def extract_numeric_features_from_df(df: pd.DataFrame, max_cols: int = INPUT_FEATURES) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Given a dataframe for a job log file, select up to `max_cols` numeric columns and produce:
+      X: (n_rows, max_cols) numeric features (missing columns padded with zeros)
+      y: (n_rows,) target computed as the row-wise mean of selected numeric features (proxy target)
+    Returns arrays; rows with all-zero features (if any) are still included.
+    """
+    numeric = df.select_dtypes(include=[np.number]).fillna(0.0)
+    if numeric.shape[1] == 0:
+        # nothing numeric -> return empty
+        return np.empty((0, max_cols), dtype=np.float32), np.empty((0,), dtype=np.float32)
+    # take first up to max_cols columns
+    cols = list(numeric.columns)[:max_cols]
+    X = numeric[cols].to_numpy(dtype=np.float32)
+    # if fewer columns than max_cols, pad to the right
+    if X.shape[1] < max_cols:
+        pad = np.zeros((X.shape[0], max_cols - X.shape[1]), dtype=np.float32)
+        X = np.hstack([X, pad])
+    # proxy target: mean of selected features per row (normalized later globally)
+    y = np.mean(X[:, :len(cols)], axis=1).astype(np.float32)
+    return X, y
+
+
+def build_clients_from_files(files: List[str], num_clients: int = NUM_CLIENTS, input_features: int = INPUT_FEATURES
+                             ) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], Tuple[np.ndarray, np.ndarray]]:
+    """
+    Read files, convert each file's rows to (X, y), then distribute rows round-robin into `num_clients` batches.
+    Also build a global test set from held-out files (TEST_HOLDOUT_RATIO fraction of files).
+    Returns: clients_data list of (X_client, y_client) and (X_test, y_test)
+    """
+    files = files.copy()
+    random.shuffle(files)
+    n_holdout = max(1, int(len(files) * TEST_HOLDOUT_RATIO))
+    holdout_files = files[:n_holdout]
+    data_files = files[n_holdout:]
+
+    # build global test set from holdout files
+    X_test_list, y_test_list = [], []
+    for f in holdout_files:
+        try:
+            df = pd.read_csv(f, low_memory=True)
+        except Exception:
+            continue
+        Xf, yf = extract_numeric_features_from_df(df, max_cols=input_features)
+        if Xf.shape[0] > 0:
+            X_test_list.append(Xf); y_test_list.append(yf)
+    if X_test_list:
+        X_test = np.vstack(X_test_list); y_test = np.concatenate(y_test_list)
+    else:
+        X_test = np.empty((0, input_features), dtype=np.float32); y_test = np.empty((0,), dtype=np.float32)
+
+    # pool all rows from data_files
+    pool_X = []
+    pool_y = []
+    for f in data_files:
+        try:
+            df = pd.read_csv(f, low_memory=True)
+        except Exception:
+            continue
+        Xf, yf = extract_numeric_features_from_df(df, max_cols=input_features)
+        if Xf.shape[0] > 0:
+            pool_X.append(Xf); pool_y.append(yf)
+    if not pool_X:
+        raise RuntimeError("No usable numeric rows found in dataset files.")
+    pool_X = np.vstack(pool_X); pool_y = np.concatenate(pool_y)
+
+    # shuffle rows
+    idx = np.arange(pool_X.shape[0])
+    np.random.shuffle(idx)
+    pool_X = pool_X[idx]; pool_y = pool_y[idx]
+
+    # round-robin assign rows to clients
+    clients_chunks = [[] for _ in range(num_clients)]
+    clients_chunks_y = [[] for _ in range(num_clients)]
+    for i in range(pool_X.shape[0]):
+        cid = i % num_clients
+        clients_chunks[cid].append(pool_X[i])
+        clients_chunks_y[cid].append(pool_y[i])
+
+    clients_data = []
+    for cid in range(num_clients):
+        Xc = np.vstack(clients_chunks[cid]).astype(np.float32) if clients_chunks[cid] else np.empty((0, input_features), dtype=np.float32)
+        yc = np.array(clients_chunks_y[cid], dtype=np.float32) if clients_chunks_y[cid] else np.empty((0,), dtype=np.float32)
+        # ensure small clients are padded with tiny random data to avoid empty datasets
+        if Xc.shape[0] < 10:
+            # create small synthetic rows (rare)
+            extra = np.random.rand(10, input_features).astype(np.float32) * 1e-3
+            Xc = np.vstack([Xc, extra]) if Xc.size else extra
+            yc = np.concatenate([yc, np.zeros(10, dtype=np.float32)]) if yc.size else np.zeros(10, dtype=np.float32)
+        clients_data.append((Xc, yc))
+    return clients_data, (X_test, y_test)
+
+
+# ---------------- Model (local client) ----------------
+def create_regressor(input_dim: int):
+    model = models.Sequential([
+        layers.InputLayer(input_shape=(input_dim,)),
+        layers.Dense(128, activation='relu'),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=optimizers.Adam(learning_rate=LEARNING_RATE),
+                  loss=losses.MeanSquaredError(),
+                  metrics=[metrics.MeanSquaredError()])
+    return model
+
+
+# ---------------- Client & Scheduler & Server ----------------
+class GreClient:
+    def __init__(self, cid: int, X: np.ndarray, y: np.ndarray):
+        self.id = cid
+        self.X = X
+        self.y = y
+        self.n = X.shape[0]
+        self.model = create_regressor(X.shape[1])
+        # derive computation_power from local data: lower mean target -> lower load -> higher compute power
+        # computation_power in (0, 1]; we invert mean(y) to produce it
+        mean_y = float(np.mean(y)) if y.size else 0.0
+        self.comp_power = 1.0 / (1.0 + mean_y)  # deterministic and reproducible
+        # local scaler for stability (we will also apply global scaler before training)
+        self.scaler = None
+
+    def set_weights(self, weights):
+        self.model.set_weights(weights)
+
+    def get_weights(self):
+        return self.model.get_weights()
+
+    def local_train(self, epochs=LOCAL_EPOCHS, batch_size=BATCH_SIZE, verbose=0):
+        if self.X.shape[0] == 0:
+            return self.get_weights()
+        # optional resource monitoring
+        if psutil:
+            cpu0 = psutil.cpu_percent(interval=None)
+            mem0 = psutil.virtual_memory().percent
+        # perform local training
+        self.model.fit(self.X, self.y, epochs=epochs, batch_size=batch_size, verbose=verbose)
+        if psutil:
+            cpu1 = psutil.cpu_percent(interval=None)
+            mem1 = psutil.virtual_memory().percent
+            print(f"Client {self.id} - CPU Δ: {cpu1 - cpu0:.2f}%, MEM Δ: {mem1 - mem0:.2f}%")
+        return self.get_weights()
+
+
 class GreedyTaskScheduler:
-    def __init__(self, clients, max_resources):
-        self.clients = clients  # List of client objects
-        self.resource_pool = max_resources  # Available resources for task scheduling
-    
-    def allocate_resources(self):
+    def __init__(self, clients: List[GreClient], resource_pool: float = RESOURCE_POOL, scaling: float = RESOURCE_SCALING):
+        self.clients = clients
+        self.resource_pool = resource_pool
+        self.scaling = scaling
+
+    def allocate(self) -> dict:
         """
-        Greedily allocates resources to the clients based on their computation power.
-        Higher computation power clients get higher priority in task scheduling.
+        Greedy allocation by priority = comp_power * avg_local_target.
+        Higher priority clients receive resource first until pool exhausted.
+        Returns mapping client_id -> allocated_resource.
         """
-        # Sort clients by their computation power (descending order)
-        sorted_clients = sorted(self.clients, key=lambda x: x.computation_power, reverse=True)
-        resource_allocation = defaultdict(float)
-        
-        # Greedy allocation of resources based on computation power
-        for client in sorted_clients:
-            allocation = min(self.resource_pool, client.computation_power * RESOURCE_SCALING_FACTOR)
-            resource_allocation[client.client_id] = allocation
-            self.resource_pool -= allocation
-            
-            if self.resource_pool <= 0:
+        pool = self.resource_pool
+        # compute avg local target per client
+        priorities = []
+        for c in self.clients:
+            avg_t = float(np.mean(c.y)) if c.y.size else 0.0
+            pri = c.comp_power * avg_t
+            priorities.append((c.id, pri))
+        # sort descending by priority
+        priorities.sort(key=lambda x: x[1], reverse=True)
+        alloc = {c.id: 0.0 for c in self.clients}
+        for cid, pri in priorities:
+            if pool <= 0:
                 break
-        
-        return resource_allocation
+            c = next(filter(lambda x: x.id == cid, self.clients))
+            request = c.comp_power * self.scaling * 10.0  # scale factor to map comp_power->resource units
+            assigned = min(pool, request)
+            alloc[cid] = assigned
+            pool -= assigned
+        return alloc
 
-# Federated Learning server
-class FederatedServer:
-    def __init__(self):
-        self.global_model = None  # Placeholder for global model
-    
-    def aggregate_models(self, client_models):
-        """
-        Aggregates the models from all clients to update the global model.
-        """
-        # Averaging the models (simplified aggregation rule)
-        aggregated_model = sum(client_models) / len(client_models)
-        return aggregated_model
 
-    def update_global_model(self, client_models):
-        """
-        Updates the global model with the aggregated models from clients.
-        Also measures communication latency.
-        """
-        start_time = time.time()  # Start time for measuring latency
-        self.global_model = self.aggregate_models(client_models)
-        end_time = time.time()  # End time for measuring latency
-        
-        latency = end_time - start_time  # Calculate latency
-        print(f"Communication Latency: {latency:.4f} seconds")
+class GreServer:
+    def __init__(self, clients: List[GreClient]):
+        self.clients = clients
+        # initialize global weights as the average of client initial weights
+        init_weights = [c.get_weights() for c in clients if c.get_weights()]
+        self.global_weights = init_weights[0] if init_weights else None
+        if init_weights and len(init_weights) > 1:
+            self.global_weights = self.fedavg(init_weights)
 
-# Main Federated Learning process with Greedy FL
-class GreedyFL:
-    def __init__(self, num_clients, num_rounds, max_resources):
-        self.clients = [Client(client_id=i, data_size=random.randint(1000, 5000), 
-                               computation_power=random.uniform(1, 10)) for i in range(num_clients)]
-        self.num_rounds = num_rounds
-        self.scheduler = GreedyTaskScheduler(self.clients, max_resources)
-        self.server = FederatedServer()
-
-    def run(self):
+    def fedavg(self, weight_lists: List[List[np.ndarray]], sample_counts: List[int] = None) -> List[np.ndarray]:
         """
-        Executes the Greedy Federated Learning algorithm over multiple rounds.
+        Weighted FedAvg by sample_counts if provided, else simple average.
+        weight_lists: list of model.get_weights()
+        sample_counts: list of ints (same length), optional
         """
-        for round_num in range(self.num_rounds):
-            print(f"--- Round {round_num + 1} ---")
-            
-            # Allocate resources based on client computation power
-            resource_allocation = self.scheduler.allocate_resources()
-            print(f"Resource Allocation: {resource_allocation}")
-            
-            client_losses = []
-            client_models = []
-            successful_clients = 0
-            
-            # Each client computes its local update and returns its loss
-            for client in self.clients:
-                # Simulate network failure for some clients
-                if random.random() > FAILURE_RATE:
-                    loss = client.train(epochs=1)  # Training the client model
-                    client_losses.append(loss)
-                    client_models.append(np.random.rand())  # Placeholder for local model update
-                    successful_clients += 1
-                else:
-                    print(f"Client {client.client_id} failed to communicate.")
-            
-            if successful_clients > 0:
-                # Aggregation of models at the server
-                self.server.update_global_model(client_models)
-                print(f"Global Model Updated: {self.server.global_model}")
-            
-            # Logging average loss for this round
-            avg_loss = sum(client_losses) / len(client_losses) if client_losses else float('inf')
-            print(f"Average Loss in Round {round_num + 1}: {avg_loss}")
+        if not weight_lists:
+            return None
+        if sample_counts is None:
+            # simple average
+            avg = []
+            n_models = len(weight_lists)
+            for layer_idx in range(len(weight_lists[0])):
+                layer_stack = np.stack([w[layer_idx] for w in weight_lists], axis=0)
+                avg.append(np.mean(layer_stack, axis=0))
+            return avg
+        else:
+            total = float(sum(sample_counts))
+            avg = []
+            for layer_idx in range(len(weight_lists[0])):
+                acc = np.zeros_like(weight_lists[0][layer_idx])
+                for w, n in zip(weight_lists, sample_counts):
+                    acc += w[layer_idx] * (n / total)
+                avg.append(acc)
+            return avg
 
-# Running the Greedy Federated Learning simulation
+    def update_global(self, collected_weights: List[List[np.ndarray]], sample_counts: List[int]):
+        start = time.time()
+        self.global_weights = self.fedavg(collected_weights, sample_counts)
+        # push to clients
+        for c in self.clients:
+            c.set_weights(self.global_weights)
+        end = time.time()
+        latency = end - start
+        print(f"Aggregation latency: {latency:.4f} s")
+
+
+# ---------------- Orchestration ----------------
+def run_greedy_fl(clients_data: List[Tuple[np.ndarray, np.ndarray]], X_test: np.ndarray, y_test: np.ndarray):
+    # global standardization: fit scaler on all client data + test
+    all_X = np.vstack([X for X, _ in clients_data] + ([X_test] if X_test.shape[0] > 0 else []))
+    scaler = StandardScaler()
+    scaler.fit(all_X)
+    clients_objs = []
+    for i, (Xc, yc) in enumerate(clients_data):
+        Xc_s = scaler.transform(Xc).astype(np.float32)
+        yc_s = yc.astype(np.float32)
+        cl = GreClient(i, Xc_s, yc_s)
+        clients_objs.append(cl)
+
+    server = GreServer(clients_objs)
+    scheduler = GreedyTaskScheduler(clients_objs)
+
+    # initial broadcast
+    if server.global_weights:
+        for c in clients_objs:
+            c.set_weights(server.global_weights)
+
+    # main FL rounds
+    for rnd in range(1, GLOBAL_ROUNDS + 1):
+        print(f"\n=== Gre-FL Round {rnd}/{GLOBAL_ROUNDS} ===")
+        # Greedy allocation
+        allocation = scheduler.allocate()
+        print("Resource allocation (top entries):", dict(list(allocation.items())[:6]))
+
+        # clients train (simulate failures)
+        collected_weights = []
+        sample_counts = []
+        for c in clients_objs:
+            if random.random() < FAILURE_RATE:
+                print(f"Client {c.id} failed to send update (simulated).")
+                continue
+            # optionally log allocated resource (not used directly in training here)
+            allocated = allocation.get(c.id, 0.0)
+            # local training
+            w = c.local_train()
+            collected_weights.append(w)
+            sample_counts.append(c.n)
+            print(f" Client {c.id} trained on {c.n} samples; comp_power={c.comp_power:.3f}; allocated={allocated:.2f}")
+
+        # aggregate if any updates received
+        if collected_weights:
+            server.update_global(collected_weights, sample_counts)
+        else:
+            print("No client updates this round — skipping aggregation.")
+
+        # evaluate global model on test (if available)
+        if X_test.shape[0] > 0 and server.global_weights is not None:
+            # set a temporary model to evaluate
+            eval_model = create_regressor(X_test.shape[1])
+            eval_model.set_weights(server.global_weights)
+            loss = eval_model.evaluate(X_test, y_test, verbose=0)
+            if isinstance(loss, list): mse = float(loss[0])
+            else: mse = float(loss)
+            print(f" Global test MSE after round {rnd}: {mse:.6f}")
+        else:
+            print("No global test evaluation (no test samples or no global weights).")
+
+    print("\nGreedy Federated Learning finished.")
+
+
+# ---------------- Main ----------------
 if __name__ == "__main__":
-    greedy_fl = GreedyFL(num_clients=NUM_CLIENTS, num_rounds=NUM_ROUNDS, max_resources=MAX_RESOURCES)
-    greedy_fl.run()
+    files = list_csv_files(DATA_DIR)
+    clients_data, (X_test, y_test) = build_clients_from_files(files, num_clients=NUM_CLIENTS, input_features=INPUT_FEATURES)
+    # optionally global standardization for y as well: y already 0..1 per-file mean; if desired, keep as-is
+    run_greedy_fl(clients_data, X_test, y_test)

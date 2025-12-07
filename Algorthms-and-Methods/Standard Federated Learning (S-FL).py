@@ -1,244 +1,281 @@
-# Import necessary libraries
-import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from sklearn.model_selection import train_test_split
-from sklearn.datasets import load_breast_cancer
-from sklearn.preprocessing import StandardScaler
-import time  # For measuring communication latency
-import psutil  # For measuring resource consumption
+"""
+Standard Federated Learning (S-FL) on Google 2019 Cluster samples.
+- Task: predict next-step resource usage (regression) using sliding-window samples
+- Local models: small MLP (no pretrained libs)
+- Server: FedAvg weighted by client sample counts
+Run:
+  python sfl_google_cluster.py
+"""
+
+import os
+import glob
 import random
+import math
+import time
+from typing import List, Tuple
 
-# Set random seed for reproducibility
-np.random.seed(42)
-tf.random.set_seed(42)
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, losses, metrics
 
-# Simulating a basic Federated Learning (FL) environment
-class Client:
+# ---------------- Config ----------------
+DATA_DIR = "./data"            # place Google cluster CSV files here
+NUM_CLIENTS = 10               # number of federated clients to simulate
+INPUT_LEN = 32                 # sliding-window length (features per sample)
+SAMPLE_STEP = 1                # sliding step
+LOCAL_EPOCHS = 3               # local epochs per round
+BATCH_SIZE = 32
+GLOBAL_ROUNDS = 15
+LEARNING_RATE = 1e-3
+FAILURE_RATE = 0.10            # probability a client fails to send update in a round
+TEST_FILE_HOLDOUT = 0.15       # fraction of files held out as global test set
+RANDOM_SEED = 42
+
+# reproducibility
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+
+
+# ---------------- Data utilities ----------------
+def find_csv_files(data_dir: str) -> List[str]:
+    files = glob.glob(os.path.join(data_dir, "*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No CSV files found under {data_dir}. Download dataset and place CSVs there.")
+    return sorted(files)
+
+
+def file_series_to_windows(path: str, input_len: int = INPUT_LEN, step: int = SAMPLE_STEP
+                           ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Represents a client in the federated learning framework. Each client
-    holds a local dataset and trains a model using this dataset.
+    Read CSV, choose first numeric column, normalize, build sliding-window samples.
+    Returns X (N_samples x input_len), y (N_samples,) where y is next-step value (regression).
     """
-    def __init__(self, client_id, data, labels):
-        self.client_id = client_id
-        self.data = data
-        self.labels = labels
-        self.model = self.create_model()
+    df = pd.read_csv(path, low_memory=True)
+    # select numeric columns
+    numeric = df.select_dtypes(include=[np.number]).fillna(0.0)
+    if numeric.shape[1] == 0:
+        return np.empty((0, input_len), dtype=np.float32), np.empty((0,), dtype=np.float32)
+    col = numeric.columns[0]
+    series = numeric[col].values.astype(np.float32)
+    if series.size <= input_len:
+        return np.empty((0, input_len), dtype=np.float32), np.empty((0,), dtype=np.float32)
 
-    def create_model(self):
-        """
-        Defines the local neural network model architecture.
-        Returns:
-            model (tf.keras.Model): A simple neural network model for classification.
-        """
-        model = models.Sequential([
-            layers.InputLayer(input_shape=(30,)),
-            layers.Dense(64, activation='relu'),
-            layers.Dense(32, activation='relu'),
-            layers.Dense(1, activation='sigmoid')
-        ])
-        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-        return model
+    # normalize series (per-file)
+    if series.max() > series.min():
+        series = (series - series.min()) / (series.max() - series.min())
+    else:
+        series = np.zeros_like(series)
 
-    def train(self, epochs=1, batch_size=32):
-        """
-        Trains the model on local data while measuring resource consumption.
-        Args:
-            epochs (int): Number of epochs to train.
-            batch_size (int): Batch size for training.
-        Returns:
-            history (tf.keras.callbacks.History): Training history for analysis.
-        """
-        start_cpu = psutil.cpu_percent(interval=None)
-        start_memory = psutil.virtual_memory().percent
+    X_list = []
+    y_list = []
+    for i in range(0, len(series) - input_len, step):
+        window = series[i:i + input_len]
+        target = series[i + input_len]  # next step
+        X_list.append(window)
+        y_list.append(target)
+    if not X_list:
+        return np.empty((0, input_len), dtype=np.float32), np.empty((0,), dtype=np.float32)
+    return np.stack(X_list, axis=0).astype(np.float32), np.array(y_list, dtype=np.float32)
 
-        history = self.model.fit(self.data, self.labels, epochs=epochs, batch_size=batch_size, verbose=0)
 
-        end_cpu = psutil.cpu_percent(interval=None)
-        end_memory = psutil.virtual_memory().percent
+def build_clients_from_files(files: List[str], num_clients: int = NUM_CLIENTS,
+                             input_len: int = INPUT_LEN) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], Tuple[np.ndarray, np.ndarray]]:
+    """
+    Convert files to per-client datasets using sliding-window.
+    Splits some files as global test holdout.
+    Returns:
+      clients_data: list of (X_client, y_client)
+      (X_test, y_test): global test set (concatenated windows from holdout files)
+    """
+    # shuffle files and select test holdout files
+    files = files.copy()
+    random.shuffle(files)
+    num_holdout = max(1, int(len(files) * TEST_FILE_HOLDOUT))
+    holdout_files = files[:num_holdout]
+    pool_files = files[num_holdout:]
 
-        print(f"Client {self.client_id} - CPU Consumption: {end_cpu - start_cpu:.2f}%, Memory Consumption: {end_memory - start_memory:.2f}%")
-        return history
+    # build test set
+    X_test_list, y_test_list = [], []
+    for f in holdout_files:
+        Xf, yf = file_series_to_windows(f, input_len)
+        if Xf.shape[0] > 0:
+            X_test_list.append(Xf)
+            y_test_list.append(yf)
+    if X_test_list:
+        X_test = np.vstack(X_test_list)
+        y_test = np.concatenate(y_test_list)
+    else:
+        X_test = np.empty((0, input_len), dtype=np.float32)
+        y_test = np.empty((0,), dtype=np.float32)
+
+    # for pool files create per-file windows and group by clients
+    per_file_windows = []
+    for f in pool_files:
+        Xf, yf = file_series_to_windows(f, input_len)
+        if Xf.shape[0] > 0:
+            per_file_windows.append((Xf, yf))
+
+    if not per_file_windows:
+        raise RuntimeError("No usable windows extracted from data files. Check CSV contents.")
+
+    # distribute files (and their windows) to clients round-robin
+    clients_data = [ ([],[]) for _ in range(num_clients) ]  # (list_X_chunks, list_y_chunks)
+    for idx, (Xf, yf) in enumerate(per_file_windows):
+        client_idx = idx % num_clients
+        clients_data[client_idx][0].append(Xf)
+        clients_data[client_idx][1].append(yf)
+
+    # concatenate chunks to produce final arrays
+    final_clients = []
+    for chunks_x, chunks_y in clients_data:
+        if chunks_x:
+            Xc = np.vstack(chunks_x)
+            yc = np.concatenate(chunks_y)
+        else:
+            # if a client got no data, create tiny random placeholder (should not happen if enough files)
+            Xc = np.random.rand(20, input_len).astype(np.float32)
+            yc = np.random.rand(20).astype(np.float32)
+        final_clients.append((Xc, yc))
+    return final_clients, (X_test, y_test)
+
+
+# ---------------- Model and FL classes ----------------
+def create_regressor(input_len: int = INPUT_LEN) -> tf.keras.Model:
+    model = models.Sequential([
+        layers.InputLayer(input_shape=(input_len,)),
+        layers.Dense(128, activation='relu'),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=optimizers.Adam(LEARNING_RATE),
+                  loss=losses.MeanSquaredError(),
+                  metrics=[metrics.MeanSquaredError()])
+    return model
+
+
+class FLClient:
+    def __init__(self, cid: int, X: np.ndarray, y: np.ndarray):
+        self.id = cid
+        self.X = X
+        self.y = y
+        self.n = X.shape[0]
+        self.model = create_regressor(INPUT_LEN)
+
+    def set_weights(self, weights):
+        self.model.set_weights(weights)
 
     def get_weights(self):
-        """
-        Returns the current model weights after training.
-        Returns:
-            list: List of model weight arrays.
-        """
         return self.model.get_weights()
 
-    def set_weights(self, global_weights):
-        """
-        Sets the model's weights to the globally aggregated weights.
-        Args:
-            global_weights (list): The aggregated weights from the server.
-        """
-        self.model.set_weights(global_weights)
+    def train(self, epochs=LOCAL_EPOCHS, batch_size=BATCH_SIZE, verbose=0):
+        self.model.fit(self.X, self.y, epochs=epochs, batch_size=batch_size, verbose=verbose)
+        return self.get_weights()
 
-class Server:
-    """
-    Represents the central server in the federated learning framework. It aggregates
-    the weights from all participating clients and updates the global model.
-    """
-    def __init__(self, num_clients):
-        self.global_model = self.create_model()
-        self.clients = []
-        self.num_clients = num_clients
 
-    def create_model(self):
-        """
-        Defines the global model architecture, identical to the clients' models.
-        Returns:
-            model (tf.keras.Model): Global model architecture.
-        """
-        model = models.Sequential([
-            layers.InputLayer(input_shape=(30,)),
-            layers.Dense(64, activation='relu'),
-            layers.Dense(32, activation='relu'),
-            layers.Dense(1, activation='sigmoid')
-        ])
-        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-        return model
+class FLServer:
+    def __init__(self, clients: List[FLClient]):
+        self.clients = clients
+        self.global_model = create_regressor(INPUT_LEN)
+        self.global_weights = self.global_model.get_weights()
 
-    def aggregate_weights(self, client_weights):
-        """
-        Aggregates weights from all clients by averaging them.
-        Args:
-            client_weights (list of lists): List containing weights from all clients.
-        Returns:
-            aggregated_weights (list): Aggregated (averaged) weights.
-        """
-        # Initialize the aggregate with zeros of the same shape as the weights
-        averaged_weights = [np.zeros_like(w) for w in client_weights[0]]
-        
-        for weights in client_weights:
-            for i in range(len(averaged_weights)):
-                averaged_weights[i] += weights[i]
-        
-        # Average the weights by the number of clients
-        averaged_weights = [w / len(client_weights) for w in averaged_weights]
-        return averaged_weights
+    def broadcast(self):
+        for c in self.clients:
+            c.set_weights(self.global_weights)
 
-    def update_global_model(self, client_weights):
+    def aggregate_fedavg(self, client_weights: List[Tuple[List[np.ndarray], int]]):
         """
-        Updates the global model with the aggregated weights from clients.
-        Args:
-            client_weights (list of lists): List containing the model weights from all clients.
+        client_weights: list of tuples (weights_list, num_samples)
+        Weighted FedAvg by num_samples.
         """
-        start_time = time.time()  # Start time for measuring latency
-        aggregated_weights = self.aggregate_weights(client_weights)
-        self.global_model.set_weights(aggregated_weights)
-        end_time = time.time()  # End time for measuring latency
-        
-        latency = end_time - start_time  # Calculate latency
-        print(f"Communication Latency: {latency:.4f} seconds")
+        total_samples = sum(n for _, n in client_weights)
+        if total_samples == 0:
+            return
+        # initialize accumulator
+        avg_w = [np.zeros_like(w) for w in client_weights[0][0]]
+        for weights, n in client_weights:
+            for i in range(len(avg_w)):
+                avg_w[i] += weights[i] * (n / total_samples)
+        self.global_weights = avg_w
+        self.global_model.set_weights(self.global_weights)
 
-    def evaluate_global_model(self, test_data, test_labels):
-        """
-        Evaluates the global model on a validation or test dataset.
-        Args:
-            test_data (np.array): Test data.
-            test_labels (np.array): Ground truth labels for the test data.
-        Returns:
-            evaluation_metrics (dict): Dictionary containing loss and accuracy.
-        """
-        loss, accuracy = self.global_model.evaluate(test_data, test_labels, verbose=0)
-        return {'loss': loss, 'accuracy': accuracy}
+    def evaluate_global(self, X_test: np.ndarray, y_test: np.ndarray):
+        if X_test.shape[0] == 0:
+            return {'mse': None, 'samples': 0}
+        loss = self.global_model.evaluate(X_test, y_test, verbose=0)
+        # Keras returns [loss, mse] for compiled metrics; we used MSE as loss and metric identical -> return loss
+        if isinstance(loss, list):
+            mse_val = loss[0]
+        else:
+            mse_val = float(loss)
+        return {'mse': float(mse_val), 'samples': X_test.shape[0]}
 
-    def federated_learning_with_failures(self, clients, test_data, test_labels, rounds=10, epochs=1, failure_rate=0.2):
-        """
-        Simulates federated learning with random client failures to evaluate robustness.
-        """
-        for rnd in range(rounds):
-            print(f"Round {rnd + 1}/{rounds} of Federated Learning with Failures")
-            
-            client_weights = []
-            for client in clients:
-                # Simulate network failure for some clients
-                if random.random() > failure_rate:
-                    client.train(epochs=epochs)
-                    client_weights.append(client.get_weights())
-                else:
-                    print(f"Client {client.client_id} failed to communicate.")
-            
-            if client_weights:
-                self.update_global_model(client_weights)
-            
-            # Evaluate global model
-            eval_metrics = self.evaluate_global_model(test_data, test_labels)
-            print(f"Global Model - Accuracy: {eval_metrics['accuracy']:.4f}, Loss: {eval_metrics['loss']:.4f}")
 
-# Load and preprocess the dataset
-def load_and_prepare_data():
-    """
-    Loads and preprocesses the Breast Cancer dataset from sklearn.
-    Splits the data into client-specific datasets and a global test set.
-    Returns:
-        clients (list): List of client objects with their respective datasets.
-        test_data (np.array): Global test data.
-        test_labels (np.array): Global test labels.
-    """
-    data = load_breast_cancer()
-    X = data['data']
-    y = data['target']
-    
-    # Standardizing the data for better performance
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    # Split the data into training (80%) and testing (20%)
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
-    
-    # Simulate multiple clients by splitting the training data
-    num_clients = 5
-    client_data_size = len(X_train) // num_clients
-    clients = []
-    
-    for i in range(num_clients):
-        start_index = i * client_data_size
-        end_index = start_index + client_data_size
-        client = Client(i, X_train[start_index:end_index], y_train[start_index:end_index])
-        clients.append(client)
-    
-    return clients, X_test, y_test
+# ---------------- Federated training orchestration ----------------
+def run_federated_learning(clients_data: List[Tuple[np.ndarray, np.ndarray]],
+                           X_test: np.ndarray, y_test: np.ndarray,
+                           rounds: int = GLOBAL_ROUNDS,
+                           failure_rate: float = FAILURE_RATE):
+    # instantiate clients
+    clients = [FLClient(i, X, y) for i, (X, y) in enumerate(clients_data)]
+    server = FLServer(clients)
+    print(f"Initialized {len(clients)} clients. Test set: {X_test.shape[0]} samples.")
 
-# Federated Learning procedure
-def federated_learning(server, clients, test_data, test_labels, rounds=10, epochs=1):
-    """
-    Implements the Standard Federated Learning process, where the server aggregates
-    model updates from multiple clients after each round of local training.
-    Args:
-        server (Server): The central server object managing aggregation.
-        clients (list of Client): List of client objects participating in the training.
-        test_data (np.array): Test dataset for evaluating the global model.
-        test_labels (np.array): Test labels for model evaluation.
-        rounds (int): Number of federated learning communication rounds.
-        epochs (int): Number of local epochs clients train per round.
-    """
-    for rnd in range(rounds):
-        print(f"Round {rnd + 1}/{rounds} of Federated Learning")
-        
-        # Step 1: Clients train locally
-        client_weights = []
-        for client in clients:
-            client.train(epochs=epochs)
-            client_weights.append(client.get_weights())
-        
-        # Step 2: Server aggregates client weights
-        server.update_global_model(client_weights)
-        
-        # Step 3: Distribute the global model back to the clients
-        for client in clients:
-            client.set_weights(server.global_model.get_weights())
-        
-        # Step 4: Evaluate global model on test data
-        eval_metrics = server.evaluate_global_model(test_data, test_labels)
-        print(f"Global Model - Accuracy: {eval_metrics['accuracy']:.4f}, Loss: {eval_metrics['loss']:.4f}")
+    # initial broadcast
+    server.broadcast()
 
-# Run the experiment
+    for rnd in range(1, rounds + 1):
+        print(f"\n=== Global Round {rnd}/{rounds} ===")
+        client_updates = []
+        # each client optionally trains and sends update
+        for c in clients:
+            if random.random() < failure_rate:
+                print(f" Client {c.id} skipped (simulated failure).")
+                continue
+            # set global weights (in case some clients lagged)
+            c.set_weights(server.global_weights)
+            weights = c.train()
+            client_updates.append((weights, c.n))
+            print(f" Client {c.id} trained on {c.n} samples.")
+
+        # aggregate
+        if client_updates:
+            server.aggregate_fedavg(client_updates)
+            # broadcast updated global to all clients
+            server.broadcast()
+        else:
+            print(" No client updates this round.")
+
+        # evaluate global model on held-out test set
+        eval_info = server.evaluate_global(X_test, y_test)
+        mse = eval_info['mse']
+        if mse is not None:
+            print(f" Global model MSE on test set: {mse:.6f}")
+        else:
+            print(" No test samples available for evaluation.")
+
+    print("\nFederated training complete.")
+    return server, clients
+
+
+# ---------------- Main ----------------
 if __name__ == "__main__":
-    clients, X_test, y_test = load_and_prepare_data()
-    server = Server(num_clients=len(clients))
-    federated_learning(server, clients, X_test, y_test, rounds=5, epochs=3)
-    server.federated_learning_with_failures(clients, X_test, y_test, rounds=5, epochs=3)
+    all_files = find_csv_files(DATA_DIR)
+    clients_data, (X_test, y_test) = build_clients_from_files(all_files, num_clients=NUM_CLIENTS, input_len=INPUT_LEN)
+    # Optionally normalize globally (we already normalized per-file; here we standardize global features)
+    if X_test.shape[0] > 0:
+        scaler = StandardScaler()
+        # fit scaler on clients' data combined to standardize globally
+        all_X = np.vstack([X for X, _ in clients_data] + ([X_test] if X_test.shape[0] > 0 else []))
+        scaler.fit(all_X)
+        clients_data = [(scaler.transform(X).astype(np.float32), y.astype(np.float32)) for X, y in clients_data]
+        X_test = scaler.transform(X_test).astype(np.float32)
+    else:
+        # still ensure types
+        clients_data = [(X.astype(np.float32), y.astype(np.float32)) for X, y in clients_data]
+
+    # Run federated learning
+    server, clients = run_federated_learning(clients_data, X_test, y_test, rounds=GLOBAL_ROUNDS, failure_rate=FAILURE_RATE)
